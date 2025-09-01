@@ -35,6 +35,13 @@ def fwd_from_matba(matba: float) -> float:
 def log(msg: str):
     st.session_state.logs.append(msg)
 
+def safe_rerun():
+    # Compatible con versiones que deprecaron experimental_rerun
+    if hasattr(st, "experimental_rerun"):
+        st.experimental_rerun()
+    else:
+        st.rerun()
+
 # ========= Curvas =========
 def demo_rounds(start_month=9, rounds=9):
     """
@@ -147,7 +154,7 @@ def duplo_variants(matba):
 def build_catalog(mkt_row, curr_idx, last_i):
     matba=float(mkt_row["matba_price"])
     forward=fwd_from_matba(matba)
-    # Primero piso -> luego derivamos UP y UB con reglas de descuento y techo
+    # Primero piso -> derivamos UP y UB con reglas de descuento y techo
     prem = premium_option_base(matba, tenor_months(curr_idx,last_i), "media")
     piso_opts = piso_variants(matba, prem)
     up_opts   = ultra_piso_variants_from_piso(piso_opts)
@@ -208,6 +215,11 @@ def add_forward(qty, price, round_id, tag):
 
 # ========= Compromiso / capacidad =========
 def committed_breakdown():
+    """
+    sold_qty: forwards efectivos (incluye forward de Cargill Plus 1:1)
+    committed_wo: compromiso sin precio (pisos/UP/UB/duplos + techo pendiente de Cargill Plus)
+    committed_total = sold_qty + committed_wo
+    """
     sold_qty = sum(f["qty"] for f in st.session_state.forwards)
 
     # Pisos
@@ -226,7 +238,7 @@ def committed_breakdown():
     # Duplos
     dp_commit = sum(d["qty_total"] for d in st.session_state.duplos)
 
-    # Cargill Plus: el leg del techo
+    # Cargill Plus: SOLO el techo (el forward ya quedó en sold_qty)
     cp_commit = sum(c["qty"] for c in st.session_state.cplus)
 
     committed_wo = p_commit + up_commit + ub_commit + dp_commit + cp_commit
@@ -244,15 +256,22 @@ def select_tool_variant(tool_id,variant):
 def add_decision(qty:int):
     if not st.session_state.sel_tool or not st.session_state.sel_variant:
         return
-    left = capacity_left()
-    if qty > left + EPS:
-        msg=f"No se puede suscribir: capacidad libre {r1(left)} tn, intentaste {r1(qty)} tn."
-        log(f"⚠️ {msg}")
-        return
 
     mkt=cur_market(); rid=int(mkt["round_id"]); matba=float(mkt["matba_price"]); forward=fwd_from_matba(matba)
     total_rounds=len(st.session_state.rounds_df); rounds_left=total_rounds-(rid-1)
     t=st.session_state.sel_tool; v=st.session_state.sel_variant
+
+    # Capacidad libre considerando el tipo de herramienta
+    left = capacity_left()
+    if t == "cargill_plus":
+        # CPlus consume 2x (forward 1:1 + techo comprometido)
+        if qty*2 > left + EPS:
+            log(f"⚠️ No se puede suscribir: Cargill Plus {r1(qty)} tn equivale a {r1(qty*2)} tn y supera capacidad libre {r1(left)} tn.")
+            return
+    else:
+        if qty > left + EPS:
+            log(f"⚠️ No se puede suscribir: capacidad libre {r1(left)} tn, intentaste {r1(qty)} tn.")
+            return
 
     if t=="forward":
         add_forward(qty, forward, rid, "Forward")
@@ -288,6 +307,7 @@ def add_decision(qty:int):
         log(f"📦 ULTRABANDA suscrita: {r1(qty)} tn | piso {r1(v['piso'])} / techo {r1(v['techo'])} | prima {r1(v['prima'])} (ronda {rid}).")
 
     elif t=="cargill_plus":
+        # forward 1:1 inmediato + registro del techo
         add_forward(qty, forward+float(v["bonificacion"]), rid,
                     f"Cargill Plus — Forward ({r1(forward)} + {r1(v['bonificacion'])})")
         st.session_state.cplus.append({"qty":r1(qty),"techo":r05(v["techo"]),
@@ -317,16 +337,16 @@ def process_round_effects():
     matba=float(df.iloc[idx]["matba_price"]); rid=int(df.iloc[idx]["round_id"])
 
     # ULTRABANDA (acumula)
-    for band in st.session_state.bandas:
-        if rid<band["round_open"] or band["qty_rem"]<=EPS: continue
-        qty=min(band["daily_qty"], band["qty_rem"])
+    for b in st.session_state.bandas:
+        if rid<b["round_open"] or b["qty_rem"]<=EPS: continue
+        qty=min(b["daily_qty"], b["qty_rem"])
         if qty<=EPS: continue
-        if matba < band["piso"]: px=band["piso"]-band["prima"]
-        elif matba > band["techo"]: px=band["techo"]-band["prima"]
-        else: px=matba-band["prima"]
-        band["fixed_qty"],band["fixed_avg"]=weighted_avg(band["fixed_qty"],band["fixed_avg"],qty,px)
-        band["qty_rem"]=max(0.0,band["qty_rem"]-qty)
-        band["acum_last_round"]=rid
+        if matba < b["piso"]: px=b["piso"]-b["prima"]
+        elif matba > b["techo"]: px=b["techo"]-b["prima"]
+        else: px=matba-b["prima"]
+        b["fixed_qty"],b["fixed_avg"]=weighted_avg(b["fixed_qty"],b["fixed_avg"],qty,px)
+        b["qty_rem"]=max(0.0,b["qty_rem"]-qty)
+        b["acum_last_round"]=rid
 
     # Ultra Piso (acumula)
     for up in st.session_state.ultra_pisos:
@@ -372,129 +392,88 @@ def early_fix_ultra_piso_all_pending(up_id):
         log(f"✅ Ultra Piso fijado completamente (pendiente {r1(pending)} tn) a {r1(px)}.")
         return
 
-# ========= Cierre (robusto) =========
+# ========= Cierre =========
 def finalize_results():
     if st.session_state.already_finalized:
         return None
+    df=st.session_state.rounds_df; last_matba=float(df.iloc[-1]["matba_price"]); rid=int(df.iloc[-1]["round_id"])
+    last_forward = fwd_from_matba(last_matba)
 
-    rounds_df = st.session_state.rounds_df
-    last_row   = rounds_df.iloc[-1]
-    last_matba = float(last_row["matba_price"])
-    last_fwd   = fwd_from_matba(last_matba)
-    rid        = int(last_row["round_id"])
+    # Piso asegurado
+    for p in st.session_state.pisos:
+        if p["qty_rem"]>EPS:
+            px=max(last_matba,p["strike"])-p["prima"]
+            add_forward(p["qty_rem"],px,rid,f"Piso — Cierre (piso {r1(p['strike'])})")
+            log(f"🔒 Cierre Piso: {r1(p['qty_rem'])} tn a {r1(px)}.")
+            p["qty_rem"]=0.0
 
-    # --- Pisos asegurados ---
-    for piso in list(st.session_state.pisos):
-        if not isinstance(piso, dict):
+    # Ultra Piso
+    for up in st.session_state.ultra_pisos:
+        if up["qty_rem"]>EPS:
+            px=max(last_matba,up["strike"])-up["prima"]
+            add_forward(up["qty_rem"],px,rid,f"Ultra Piso — Cierre (piso {r1(up['strike'])})")
+            log(f"🔒 Cierre Ultra Piso (pendiente): {r1(up['qty_rem'])} tn a {r1(px)}.")
+            up["qty_rem"]=0.0
+        if up["fixed_qty"]>EPS:
+            add_forward(up["fixed_qty"], up["fixed_avg"], rid, f"Ultra Piso — Acumulado (piso {r1(up['strike'])})")
+            log(f"📊 Ultra Piso — Acumulado volcados: {r1(up['fixed_qty'])} tn a {r1(up['fixed_avg'])}.")
+
+    # ULTRABANDA
+    for b in st.session_state.bandas:
+        if b["qty_rem"]>EPS:
+            if last_matba<b["piso"]: px=b["piso"]-b["prima"]
+            elif last_matba>b["techo"]: px=b["techo"]-b["prima"]
+            else: px=last_matba-b["prima"]
+            add_forward(b["qty_rem"],px,rid,f"ULTRABANDA — Cierre (piso {r1(b['piso'])} / techo {r1(b['techo'])})")
+            log(f"🔒 Cierre ULTRABANDA (pendiente): {r1(b['qty_rem'])} tn a {r1(px)}.")
+            b["qty_rem"]=0.0
+        if b["fixed_qty"]>EPS:
+            add_forward(b["fixed_qty"], b["fixed_avg"], rid, f"ULTRABANDA — Acumulado (piso {r1(b['piso'])} / techo {r1(b['techo'])})")
+            log(f"📊 ULTRABANDA — Acumulado volcados: {r1(b['fixed_qty'])} tn a {r1(b['fixed_avg'])}.")
+
+    # Duplos → forward
+    for d in st.session_state.duplos:
+        if d["fixed_qty"]>EPS:
+            add_forward(d["fixed_qty"], d["fixed_avg"], rid,
+                        f"Duplo — (disp {r1(d['trigger'])} / acum {r1(d['accum'])}) — Acumulado")
+            log(f"📊 Duplo — Acumulado: {r1(d['fixed_qty'])} tn a {r1(d['fixed_avg'])}.")
+        unproc=max(0.0,d["qty_total"]-d["processed"])
+        if d["released_qty"]>EPS:
+            add_forward(d["released_qty"], last_forward, rid, "Duplo — Liberado Cierre")
+            log(f"🔚 Duplo — Liberado Cierre: {r1(d['released_qty'])} tn a {r1(last_forward)}.")
+        if unproc>EPS:
+            add_forward(unproc, last_forward, rid, "Duplo — No Procesado Cierre")
+            log(f"🔚 Duplo — No Procesado Cierre: {r1(unproc)} tn a {r1(last_forward)}.")
+        d["processed"]=r1(d["processed"]+unproc); d["released_qty"]=0.0
+
+    # Cargill Plus
+    for c in st.session_state.cplus:
+        if c.get("closed"):
             continue
-        # pendiente
-        if float(piso.get("qty_rem", 0.0)) > EPS:
-            px = max(last_matba, float(piso["strike"])) - float(piso["prima"])
-            add_forward(float(piso["qty_rem"]), px, rid, f"Piso — Cierre (piso {r1(piso['strike'])})")
-            log(f"🔒 Cierre Piso: {r1(piso['qty_rem'])} tn a {r1(px)}.")
-            piso["qty_rem"] = 0.0
+        px = last_matba if last_matba>c["techo"] else last_forward
+        add_forward(c["qty"], px, rid, "Cargill Plus — Expiración")
+        log(f"⏱️ Cargill Plus — Expiración: {r1(c['qty'])} tn a {r1(px)}.")
+        c["closed"] = True
 
-    # --- Ultra Piso ---
-    for up_item in list(st.session_state.ultra_pisos):
-        if not isinstance(up_item, dict):
-            continue
-        # pendiente
-        if float(up_item.get("qty_rem", 0.0)) > EPS:
-            px = max(last_matba, float(up_item["strike"])) - float(up_item["prima"])
-            add_forward(float(up_item["qty_rem"]), px, rid, f"Ultra Piso — Cierre (piso {r1(up_item['strike'])})")
-            log(f"🔒 Cierre Ultra Piso (pendiente): {r1(up_item['qty_rem'])} tn a {r1(px)}.")
-            up_item["qty_rem"] = 0.0
-        # acumulado
-        if float(up_item.get("fixed_qty", 0.0)) > EPS:
-            add_forward(float(up_item["fixed_qty"]), float(up_item["fixed_avg"]), rid,
-                        f"Ultra Piso — Acumulado (piso {r1(up_item['strike'])})")
-            log(f"📊 Ultra Piso — Acumulado volcados: {r1(up_item['fixed_qty'])} tn a {r1(up_item['fixed_avg'])}.")
-            up_item["fixed_qty"] = 0.0  # evitar duplicado
-
-    # --- ULTRABANDA ---
-    for band in list(st.session_state.bandas):
-        if not isinstance(band, dict):
-            continue
-        piso  = float(band["piso"])
-        techo = float(band["techo"])
-        prima = float(band["prima"])
-
-        # pendiente
-        if float(band.get("qty_rem", 0.0)) > EPS:
-            if last_matba < piso:
-                px = piso - prima
-            elif last_matba > techo:
-                px = techo - prima
-            else:
-                px = last_matba - prima
-            add_forward(float(band["qty_rem"]), px, rid,
-                        f"ULTRABANDA — Cierre (piso {r1(piso)} / techo {r1(techo)})")
-            log(f"🔒 Cierre ULTRABANDA (pendiente): {r1(band['qty_rem'])} tn a {r1(px)}.")
-            band["qty_rem"] = 0.0
-
-        # acumulado
-        if float(band.get("fixed_qty", 0.0)) > EPS:
-            add_forward(float(band["fixed_qty"]), float(band["fixed_avg"]), rid,
-                        f"ULTRABANDA — Acumulado (piso {r1(piso)} / techo {r1(techo)})")
-            log(f"📊 ULTRABANDA — Acumulado volcados: {r1(band['fixed_qty'])} tn a {r1(band['fixed_avg'])}.")
-            band["fixed_qty"] = 0.0
-
-    # --- Duplos ---
-    for duplo in list(st.session_state.duplos):
-        if not isinstance(duplo, dict):
-            continue
-        trigger = float(duplo["trigger"])
-        accum   = float(duplo["accum"])
-
-        # acumulado
-        if float(duplo.get("fixed_qty", 0.0)) > EPS:
-            add_forward(float(duplo["fixed_qty"]), float(duplo["fixed_avg"]), rid,
-                        f"Duplo — (disp {r1(trigger)} / acum {r1(accum)}) — Acumulado")
-            log(f"📊 Duplo — Acumulado: {r1(duplo['fixed_qty'])} tn a {r1(duplo['fixed_avg'])}.")
-            duplo["fixed_qty"] = 0.0
-
-        # liberado y no-procesado al forward
-        unproc = max(0.0, float(duplo.get("qty_total", 0.0)) - float(duplo.get("processed", 0.0)))
-        if float(duplo.get("released_qty", 0.0)) > EPS:
-            add_forward(float(duplo["released_qty"]), last_fwd, rid, "Duplo — Liberado Cierre")
-            log(f"🔚 Duplo — Liberado Cierre: {r1(duplo['released_qty'])} tn a {r1(last_fwd)}.")
-            duplo["released_qty"] = 0.0
-        if unproc > EPS:
-            add_forward(unproc, last_fwd, rid, "Duplo — No Procesado Cierre")
-            log(f"🔚 Duplo — No Procesado Cierre: {r1(unproc)} tn a {r1(last_fwd)}.")
-            duplo["processed"] = float(duplo.get("processed", 0.0)) + unproc
-
-    # --- Cargill Plus (expiración) ---
-    for cp in list(st.session_state.cplus):
-        if not isinstance(cp, dict) or cp.get("closed"):
-            continue
-        px = last_matba if last_matba > float(cp["techo"]) else last_fwd
-        add_forward(float(cp["qty"]), px, rid, "Cargill Plus — Expiración")
-        log(f"⏱️ Cargill Plus — Expiración: {r1(cp['qty'])} tn a {r1(px)}.")
-        cp["closed"] = True
-
-    # --- Venta faltante a cosecha ---
-    fdf_all = pd.DataFrame(st.session_state.forwards)
+    # Venta faltante a cosecha
+    fdf_all = pd.DataFrame(st.session_state.forwards) if st.session_state.forwards else pd.DataFrame(columns=["qty","price"])
     sold_total = float(fdf_all["qty"].sum()) if not fdf_all.empty else 0.0
     missing = max(0.0, float(st.session_state.total_volume) - sold_total)
     if missing > EPS:
-        add_forward(missing, last_fwd, rid, "Venta volumen pendiente a cosecha")
-        log(f"🌾 Venta volumen pendiente a cosecha: {r1(missing)} tn a {r1(last_fwd)}.")
+        add_forward(missing, last_forward, rid, "Venta volumen pendiente a cosecha")
+        log(f"🌾 Venta volumen pendiente a cosecha: {r1(missing)} tn a {r1(last_forward)}.")
 
     # KPIs
     fdf_all = pd.DataFrame(st.session_state.forwards)
-    sold_qty = float(fdf_all["qty"].sum()) if not fdf_all.empty else 0.0
-    sold_rev = float((fdf_all["qty"] * fdf_all["price"]).sum()) if not fdf_all.empty else 0.0
-    avg_px   = (sold_rev / sold_qty) if sold_qty > 0 else 0.0
+    sold_qty=float(fdf_all["qty"].sum()) if not fdf_all.empty else 0.0
+    sold_rev=float((fdf_all["qty"]*fdf_all["price"]).sum()) if not fdf_all.empty else 0.0
+    avg_px=(sold_rev/sold_qty) if sold_qty>0 else 0.0
 
-    st.session_state.already_finalized = True
-    return {
-        "avg_price_final": r1(avg_px),
-        "benchmarks": {
-            "Último día (MATBA)": r1(last_matba),
-            "Promedio simple del período (MATBA)": r1(float(st.session_state.rounds_df["matba_price"].mean()))
-        }
-    }
+    st.session_state.already_finalized=True
+    return {"avg_price_final": r1(avg_px),
+            "benchmarks":{"Último día (MATBA)": r1(last_matba),
+                          "Promedio simple del período (MATBA)": r1(float(st.session_state.rounds_df["matba_price"].mean()))}
+           }
 
 # ========= Vista: Forwards + acumulados mientras corre =========
 def forwards_view_df() -> pd.DataFrame:
@@ -510,13 +489,13 @@ def forwards_view_df() -> pd.DataFrame:
                     "tool": f"Ultra Piso — Acumulado (piso {r1(up['strike'])})"
                 })
         # ULTRABANDA — Acumulado
-        for band in st.session_state.bandas:
-            if band["fixed_qty"]>EPS:
-                rr = band.get("acum_last_round") or int(st.session_state.rounds_df.iloc[st.session_state.round_idx]["round_id"])
+        for b in st.session_state.bandas:
+            if b["fixed_qty"]>EPS:
+                rr = b.get("acum_last_round") or int(st.session_state.rounds_df.iloc[st.session_state.round_idx]["round_id"])
                 rows.append({
-                    "qty": r1(band["fixed_qty"]), "price": r1(band["fixed_avg"]),
+                    "qty": r1(b["fixed_qty"]), "price": r1(b["fixed_avg"]),
                     "round": int(rr),
-                    "tool": f"ULTRABANDA — Acumulado (piso {r1(band['piso'])} / techo {r1(band['techo'])})"
+                    "tool": f"ULTRABANDA — Acumulado (piso {r1(b['piso'])} / techo {r1(b['techo'])})"
                 })
         # Duplos — Acumulado
         for d in st.session_state.duplos:
@@ -535,8 +514,8 @@ init_state()
 df=st.session_state.rounds_df; idx=st.session_state.round_idx
 mkt=cur_market(); matba=float(mkt["matba_price"]); forward=fwd_from_matba(matba)
 
-st.title("🧪📈 Simulador de Soluciones Agrofinancieras (v0.15)")
-st.caption("UP y ULTRABANDA con mismas bases de strike; ULTRABANDA: techo = strike + 15 y primas aún más baratas. Curva simulada con movimientos amplios. Panel de notificaciones y control de capacidad.")
+st.title("🧪📈 Simulador de Soluciones Agrofinancieras (v0.16)")
+st.caption("UP y ULTRABANDA con mismas bases de strike; ULTRABANDA: techo = strike + 15 y primas aún más baratas. Curva simulada con movimientos amplios. Panel de notificaciones y control de capacidad. Cargill Plus cuenta doble para la capacidad (forward 1:1 + techo).")
 
 # Sidebar
 with st.sidebar:
@@ -552,7 +531,7 @@ with st.sidebar:
     up = st.file_uploader("Cargar archivo (date, matba_price)", type=["csv","xlsx","xls"]) if (source!="Simulada v0.7" and not st.session_state.already_finalized) else None
     if st.button("Aplicar fuente de datos / Reiniciar", use_container_width=True, disabled=st.session_state.already_finalized):
         ok,msg = apply_data_source(source, up)
-        if ok: st.session_state.data_source = source; st.success(msg); st.rerun()
+        if ok: st.session_state.data_source = source; st.success(msg); safe_rerun()
         else: st.error(msg)
     if st.session_state.data_source!="Simulada v0.7" and st.session_state.uploaded_snapshot:
         st.caption(f"Archivo en uso: {st.session_state.uploaded_snapshot}")
@@ -570,7 +549,7 @@ with st.sidebar:
             process_round_effects()
             if st.session_state.round_idx < len(df)-1:
                 st.session_state.round_idx += 1
-                st.rerun()
+                safe_rerun()
     with c2:
         if st.button("🏁 Finalizar y calcular", use_container_width=True, disabled=st.session_state.already_finalized):
             process_round_effects()
@@ -578,7 +557,7 @@ with st.sidebar:
             if res is not None:
                 st.session_state["final_res"]=res
             st.session_state.round_idx = len(df)-1
-            st.rerun()
+            safe_rerun()
 
 # Catálogo + agregar
 left,right = st.columns([1.15,1])
@@ -614,7 +593,7 @@ with left:
         left_cap = capacity_left()
         st.info((det or "Elegí y apretá **Seleccionar** arriba para ver los campos.") + f"  | Capacidad libre: **{r1(left_cap)} tn**")
         if st.form_submit_button("➕ Agregar", disabled=st.session_state.already_finalized):
-            add_decision(int(qty)); st.rerun()
+            add_decision(int(qty)); safe_rerun()
 
     # Panel de notificaciones / historial
     st.markdown("#### 📝 Notificaciones")
@@ -656,7 +635,7 @@ with right:
                     p["fixed_qty"],p["fixed_avg"]=weighted_avg(p["fixed_qty"],p["fixed_avg"],qfix,fix_price)
                     p["early_fixed_qty"]=p.get("early_fixed_qty",0.0)+qfix
                     log(f"✅ Piso Asegurado: fijaste {r1(qfix)} tn a {r1(fix_price)}.")
-                    st.rerun()
+                    safe_rerun()
 
     # Ultra Piso
     if st.session_state.ultra_pisos:
@@ -677,16 +656,16 @@ with right:
                 c2.write(f"Pendiente: **{pendiente} tn**")
                 if c3.button("Fijar TODO el pendiente al valor de hoy", key=f"upfix_{up['id']}", disabled=st.session_state.already_finalized):
                     early_fix_ultra_piso_all_pending(up["id"])
-                    st.rerun()
+                    safe_rerun()
 
     # ULTRABANDA
     if st.session_state.bandas:
         st.markdown("**ULTRABANDA**")
         ub_df = pd.DataFrame([{
-            "cantidad total":band["qty_total"],"cantidad remanente":band["qty_rem"],
-            "piso":band["piso"],"techo":band["techo"],"prima":band["prima"],
-            "cantidad diaria":band["daily_qty"],"cantidad fijada":band["fixed_qty"],"precio promedio":band["fixed_avg"]
-        } for band in st.session_state.bandas])
+            "cantidad total":b["qty_total"],"cantidad remanente":b["qty_rem"],
+            "piso":b["piso"],"techo":b["techo"],"prima":b["prima"],
+            "cantidad diaria":b["daily_qty"],"cantidad fijada":b["fixed_qty"],"precio promedio":b["fixed_avg"]
+        } for b in st.session_state.bandas])
         st.dataframe(df_round1(ub_df), hide_index=True, use_container_width=True)
 
     # Cargill Plus
@@ -718,7 +697,7 @@ k1.metric("Forwards vendidos (tn)", int(round(sold_eff)))
 k2.metric("Comprometido sin precio (tn)", int(round(committed_wo)))
 k3.metric("Total comprometido (tn)", int(round(committed_total)))
 k4.metric("Capacidad libre (tn)", int(round(capacity_left())))
-st.caption("El total comprometido no puede superar el volumen total configurado.")
+st.caption("El total comprometido no puede superar el volumen total configurado. Cargill Plus impacta 2× en capacidad (forward 1:1 + techo).")
 
 st.markdown("### 🧭 Volumen vendido por ronda")
 plot_df = df.copy(); plot_df["ventas_tn"]=0.0
@@ -751,4 +730,4 @@ if "final_res" in st.session_state:
     st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption("v0.15 — Nombre nuevo; UP ~25% < Piso; ULTRABANDA (mismos strikes) techo = strike+15 y ~30% < UP; curva más volátil; panel de notificaciones; control de capacidad; cierre con venta pendiente a cosecha. Forward = MATBA − 3.")
+st.caption("v0.16 — Capacidad y comprometidos corregidos para Cargill Plus (cuenta doble). UP/UB strikes coordinados; UB techo = strike+15; curva más volátil; panel de notificaciones; cierre con venta pendiente a cosecha. Forward = MATBA − 3.")
