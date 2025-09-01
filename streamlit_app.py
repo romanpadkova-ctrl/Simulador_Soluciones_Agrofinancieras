@@ -2,7 +2,17 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 
-st.set_page_config(page_title="Simuladores de Soluciones Agrofinancieras", layout="wide")
+st.set_page_config(page_title="Simulador de Soluciones Agrofinancieras", layout="wide")
+
+# --- Rerun compatible (Streamlit nuevo y viejo) ---
+def _rerun():
+    try:
+        if hasattr(st, "rerun"):
+            st.rerun()
+        else:
+            st.experimental_rerun()
+    except Exception:
+        pass
 
 # ========= Estilos =========
 st.markdown("""
@@ -408,7 +418,7 @@ def finalize_results():
             log(f"🔒 Cierre ULTRABANDA (pendiente): {r1(b['qty_rem'])} tn a {r1(px)}.")
             b["qty_rem"]=0.0
         if b["fixed_qty"]>EPS:
-            add_forward(b["fixed_qty"], b["fixed_avg"], rid, f"ULTRABANDA — Acumulado (piso {r1(b['piso'])} / techo {r1(b['techo'])})")
+            add_forward(b["fixed_qty"], b["fixed_avg"], rid, f"ULTRABANDA — Acumulado (piso {r1(b['piso'])} / techo {r1[b['techo']]}))")
             log(f"📊 ULTRABANDA — Acumulado volcados: {r1(b['fixed_qty'])} tn a {r1(b['fixed_avg'])}.")
 
     # Duplos → forward
@@ -428,7 +438,7 @@ def finalize_results():
 
     # Cargill Plus
     for c in st.session_state.cplus:
-        if c.get("closed"): 
+        if c.get("closed"):
             continue
         px = last_matba if last_matba>c["techo"] else last_forward
         add_forward(c["qty"], px, rid, "Cargill Plus — Expiración")
@@ -494,7 +504,7 @@ init_state()
 df=st.session_state.rounds_df; idx=st.session_state.round_idx
 mkt=cur_market(); matba=float(mkt["matba_price"]); forward=fwd_from_matba(matba)
 
-st.title("🧪📈 Simuladores de Soluciones Agrofinancieras (v0.15)")
+st.title("🧪📈 Simulador de Soluciones Agrofinancieras (v0.15)")
 st.caption("UP y ULTRABANDA con mismas bases de strike; ULTRABANDA: techo = strike + 15 y primas aún más baratas. Curva simulada con movimientos amplios. Panel de notificaciones y control de capacidad.")
 
 # Sidebar
@@ -511,8 +521,12 @@ with st.sidebar:
     up = st.file_uploader("Cargar archivo (date, matba_price)", type=["csv","xlsx","xls"]) if (source!="Simulada v0.7" and not st.session_state.already_finalized) else None
     if st.button("Aplicar fuente de datos / Reiniciar", use_container_width=True, disabled=st.session_state.already_finalized):
         ok,msg = apply_data_source(source, up)
-        if ok: st.session_state.data_source = source; st.success(msg); st.experimental_rerun()
-        else: st.error(msg)
+        if ok:
+            st.session_state.data_source = source
+            st.success(msg)
+            _rerun()
+        else:
+            st.error(msg)
     if st.session_state.data_source!="Simulada v0.7" and st.session_state.uploaded_snapshot:
         st.caption(f"Archivo en uso: {st.session_state.uploaded_snapshot}")
 
@@ -529,7 +543,7 @@ with st.sidebar:
             process_round_effects()
             if st.session_state.round_idx < len(df)-1:
                 st.session_state.round_idx += 1
-                st.experimental_rerun()
+                _rerun()
     with c2:
         if st.button("🏁 Finalizar y calcular", use_container_width=True, disabled=st.session_state.already_finalized):
             process_round_effects()
@@ -537,7 +551,7 @@ with st.sidebar:
             if res is not None:
                 st.session_state["final_res"]=res
             st.session_state.round_idx = len(df)-1
-            st.experimental_rerun()
+            _rerun()
 
 # Catálogo + agregar
 left,right = st.columns([1.15,1])
@@ -573,7 +587,7 @@ with left:
         left_cap = capacity_left()
         st.info((det or "Elegí y apretá **Seleccionar** arriba para ver los campos.") + f"  | Capacidad libre: **{r1(left_cap)} tn**")
         if st.form_submit_button("➕ Agregar", disabled=st.session_state.already_finalized):
-            add_decision(int(qty)); st.experimental_rerun()
+            add_decision(int(qty)); _rerun()
 
     # Panel de notificaciones / historial
     st.markdown("#### 📝 Notificaciones")
@@ -615,7 +629,7 @@ with right:
                     p["fixed_qty"],p["fixed_avg"]=weighted_avg(p["fixed_qty"],p["fixed_avg"],qfix,fix_price)
                     p["early_fixed_qty"]=p.get("early_fixed_qty",0.0)+qfix
                     log(f"✅ Piso Asegurado: fijaste {r1(qfix)} tn a {r1(fix_price)}.")
-                    st.experimental_rerun()
+                    _rerun()
 
     # Ultra Piso
     if st.session_state.ultra_pisos:
@@ -636,7 +650,7 @@ with right:
                 c2.write(f"Pendiente: **{pendiente} tn**")
                 if c3.button("Fijar TODO el pendiente al valor de hoy", key=f"upfix_{up['id']}", disabled=st.session_state.already_finalized):
                     early_fix_ultra_piso_all_pending(up["id"])
-                    st.experimental_rerun()
+                    _rerun()
 
     # ULTRABANDA
     if st.session_state.bandas:
