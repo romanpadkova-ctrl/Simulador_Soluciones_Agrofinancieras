@@ -185,6 +185,9 @@ def init_state():
     if "sel_variant" not in st.session_state: st.session_state.sel_variant=None
     if "already_finalized" not in st.session_state: st.session_state.already_finalized=False
     if "logs" not in st.session_state: st.session_state.logs=[]
+    # Gráfico estático “volumen vendido por ronda” (según decisiones)
+    if "committed_by_round" not in st.session_state:
+        st.session_state.committed_by_round = [0.0] * len(st.session_state.rounds_df)
 
 def reset_position():
     st.session_state.round_idx=0
@@ -194,6 +197,7 @@ def reset_position():
     st.session_state.sel_tool=None; st.session_state.sel_variant=None
     st.session_state.already_finalized=False
     st.session_state.logs=[]
+    st.session_state.committed_by_round = [0.0] * len(st.session_state.rounds_df)
 
 def apply_data_source(source, uploaded_file):
     if source=="Simulada v0.7":
@@ -217,36 +221,41 @@ def add_forward(qty, price, round_id, tag):
 def committed_breakdown():
     """
     sold_qty: forwards efectivos (incluye forward de Cargill Plus 1:1)
-    committed_wo: compromiso sin precio (pisos/UP/UB/duplos + techo pendiente de Cargill Plus)
-    committed_total = sold_qty + committed_wo
+    priced_commit: con precio fijado pero aún no volcado a forwards (UP/UB/Duplos fixed_qty)
+    committed_wo: compromiso sin precio pendiente:
+      - Pisos / UP / UB  => qty_rem
+      - Duplos           => released_qty + (qty_total - processed)
+      - Cargill Plus     => qty si NOT closed (solo el techo)
+    committed_total = sold_qty + priced_commit + committed_wo
     """
     sold_qty = sum(f["qty"] for f in st.session_state.forwards)
 
-    # Pisos
-    p_early = sum(p.get("early_fixed_qty", 0.0) for p in st.session_state.pisos)
-    p_total = sum(p["qty_total"] for p in st.session_state.pisos)
-    p_commit = max(0.0, p_total - p_early)
+    # Con precio (no volcados a forward): UP/UB/Duplos
+    up_priced = sum(float(up.get("fixed_qty", 0.0)) for up in st.session_state.ultra_pisos)
+    ub_priced = sum(float(b.get("fixed_qty", 0.0)) for b in st.session_state.bandas)
+    dp_priced = sum(float(d.get("fixed_qty", 0.0)) for d in st.session_state.duplos)
+    priced_commit = r1(up_priced + ub_priced + dp_priced)
 
-    # Ultra pisos
-    up_early = sum(up.get("early_fixed_qty", 0.0) for up in st.session_state.ultra_pisos)
-    up_total = sum(up["qty_total"] for up in st.session_state.ultra_pisos)
-    up_commit = max(0.0, up_total - up_early)
+    # Sin precio (pendiente real)
+    p_commit = sum(max(0.0, float(p.get("qty_rem", 0.0))) for p in st.session_state.pisos)
+    up_commit = sum(max(0.0, float(up.get("qty_rem", 0.0))) for up in st.session_state.ultra_pisos)
+    ub_commit = sum(max(0.0, float(b.get("qty_rem", 0.0))) for b in st.session_state.bandas)
 
-    # ULTRABANDA
-    ub_commit = sum(b["qty_total"] for b in st.session_state.bandas)
+    dp_commit = 0.0
+    for d in st.session_state.duplos:
+        released = float(d.get("released_qty", 0.0))
+        unprocessed = max(0.0, float(d["qty_total"]) - float(d.get("processed", 0.0)))
+        dp_commit += released + unprocessed
 
-    # Duplos
-    dp_commit = sum(d["qty_total"] for d in st.session_state.duplos)
+    cp_commit = sum(float(c["qty"]) for c in st.session_state.cplus if not c.get("closed", False))
 
-    # Cargill Plus: SOLO el techo (el forward ya quedó en sold_qty)
-    cp_commit = sum(c["qty"] for c in st.session_state.cplus)
+    committed_wo = r1(p_commit + up_commit + ub_commit + dp_commit + cp_commit)
 
-    committed_wo = p_commit + up_commit + ub_commit + dp_commit + cp_commit
-    committed_total = r1(sold_qty + committed_wo)
-    return r1(sold_qty), r1(committed_wo), r1(committed_total)
+    committed_total = r1(sold_qty + priced_commit + committed_wo)
+    return r1(sold_qty), r1(priced_commit), r1(committed_wo), r1(committed_total)
 
 def capacity_left():
-    _, _, tot = committed_breakdown()
+    _, _, _, tot = committed_breakdown()
     return max(0.0, float(st.session_state.total_volume) - float(tot))
 
 # ========= Alta de decisiones =========
@@ -272,6 +281,11 @@ def add_decision(qty:int):
         if qty > left + EPS:
             log(f"⚠️ No se puede suscribir: capacidad libre {r1(left)} tn, intentaste {r1(qty)} tn.")
             return
+
+    # Registrar "volumen vendido por ronda" en la ronda de la decisión
+    ridx = max(0, min(len(st.session_state.committed_by_round)-1, rid-1))
+    commit_units = float(qty) * (2.0 if t == "cargill_plus" else 1.0)
+    st.session_state.committed_by_round[ridx] = r1(st.session_state.committed_by_round[ridx] + commit_units)
 
     if t=="forward":
         add_forward(qty, forward, rid, "Forward")
@@ -307,7 +321,6 @@ def add_decision(qty:int):
         log(f"📦 ULTRABANDA suscrita: {r1(qty)} tn | piso {r1(v['piso'])} / techo {r1(v['techo'])} | prima {r1(v['prima'])} (ronda {rid}).")
 
     elif t=="cargill_plus":
-        # forward 1:1 inmediato + registro del techo
         add_forward(qty, forward+float(v["bonificacion"]), rid,
                     f"Cargill Plus — Forward ({r1(forward)} + {r1(v['bonificacion'])})")
         st.session_state.cplus.append({"qty":r1(qty),"techo":r05(v["techo"]),
@@ -417,6 +430,9 @@ def finalize_results():
         if up["fixed_qty"]>EPS:
             add_forward(up["fixed_qty"], up["fixed_avg"], rid, f"Ultra Piso — Acumulado (piso {r1(up['strike'])})")
             log(f"📊 Ultra Piso — Acumulado volcados: {r1(up['fixed_qty'])} tn a {r1(up['fixed_avg'])}.")
+            # limpiar priced-commit
+            up["fixed_qty"] = 0.0
+            up["fixed_avg"] = 0.0
 
     # ULTRABANDA
     for b in st.session_state.bandas:
@@ -430,6 +446,9 @@ def finalize_results():
         if b["fixed_qty"]>EPS:
             add_forward(b["fixed_qty"], b["fixed_avg"], rid, f"ULTRABANDA — Acumulado (piso {r1(b['piso'])} / techo {r1(b['techo'])})")
             log(f"📊 ULTRABANDA — Acumulado volcados: {r1(b['fixed_qty'])} tn a {r1(b['fixed_avg'])}.")
+            # limpiar priced-commit
+            b["fixed_qty"] = 0.0
+            b["fixed_avg"] = 0.0
 
     # Duplos → forward
     for d in st.session_state.duplos:
@@ -437,6 +456,9 @@ def finalize_results():
             add_forward(d["fixed_qty"], d["fixed_avg"], rid,
                         f"Duplo — (disp {r1(d['trigger'])} / acum {r1(d['accum'])}) — Acumulado")
             log(f"📊 Duplo — Acumulado: {r1(d['fixed_qty'])} tn a {r1(d['fixed_avg'])}.")
+            # limpiar priced-commit
+            d["fixed_qty"] = 0.0
+            d["fixed_avg"] = 0.0
         unproc=max(0.0,d["qty_total"]-d["processed"])
         if d["released_qty"]>EPS:
             add_forward(d["released_qty"], last_forward, rid, "Duplo — Liberado Cierre")
@@ -514,8 +536,7 @@ init_state()
 df=st.session_state.rounds_df; idx=st.session_state.round_idx
 mkt=cur_market(); matba=float(mkt["matba_price"]); forward=fwd_from_matba(matba)
 
-st.title("🧪📈 Simulador de Soluciones Agrofinancieras (v0.16)")
-st.caption("UP y ULTRABANDA con mismas bases de strike; ULTRABANDA: techo = strike + 15 y primas aún más baratas. Curva simulada con movimientos amplios. Panel de notificaciones y control de capacidad. Cargill Plus cuenta doble para la capacidad (forward 1:1 + techo).")
+st.title("🧪📈 Simulador de Soluciones Agrofinancieras")
 
 # Sidebar
 with st.sidebar:
@@ -627,7 +648,8 @@ with right:
                 qfix = col2.number_input("Cantidad a fijar ahora", min_value=0.0, max_value=float(p["qty_rem"]),
                                          value=float(p["qty_rem"]), step=1.0, key=f"pfix_{p['id']}")
                 if col3.button("Fijar ahora", key=f"pfbtn_{p['id']}", disabled=st.session_state.already_finalized):
-                    df_now=st.session_state.rounds_df; matba_now=float(df_now.iloc[st.session_state.round_idx]["matba_price"])
+                    df_now=st.session_state.rounds_df
+                    matba_now=float(df_now.iloc[st.session_state.round_idx]["matba_price"])
                     fix_price=max(matba_now,p["strike"])-p["prima"]
                     add_forward(qfix, fix_price, int(df_now.iloc[st.session_state.round_idx]["round_id"]),
                                 f"Fijación Piso Asegurado (piso {r1(p['strike'])})")
@@ -689,23 +711,26 @@ sold_qty = float(fdf["qty"].sum()) if not fdf.empty else 0.0
 sold_rev = float((fdf["qty"]*fdf["price"]).sum()) if not fdf.empty else 0.0
 avg_now = r1((sold_rev/sold_qty) if sold_qty>0 else 0.0)
 
-sold_eff, committed_wo, committed_total = committed_breakdown()
+sold_eff, priced_commit, committed_wo, committed_total = committed_breakdown()
 
 st.markdown("### 📈 Vista general")
-k1,k2,k3,k4 = st.columns(4)
+k1,k2,k3,k4,k5 = st.columns(5)
 k1.metric("Forwards vendidos (tn)", int(round(sold_eff)))
-k2.metric("Comprometido sin precio (tn)", int(round(committed_wo)))
-k3.metric("Total comprometido (tn)", int(round(committed_total)))
-k4.metric("Capacidad libre (tn)", int(round(capacity_left())))
+k2.metric("Comprometido con precio (tn)", int(round(priced_commit)))
+k3.metric("Comprometido sin precio (tn)", int(round(committed_wo)))
+k4.metric("Total comprometido (tn)", int(round(committed_total)))
+k5.metric("Capacidad libre (tn)", int(round(capacity_left())))
 st.caption("El total comprometido no puede superar el volumen total configurado. Cargill Plus impacta 2× en capacidad (forward 1:1 + techo).")
 
-st.markdown("### 🧭 Volumen vendido por ronda")
-plot_df = df.copy(); plot_df["ventas_tn"]=0.0
-for s in fdf.to_dict("records"):
-    ridx = int(s["round"])-1
-    if 0<=ridx<len(plot_df): plot_df.loc[ridx,"ventas_tn"] += float(s["qty"])
-st.plotly_chart(px.bar(plot_df, x="date", y="ventas_tn", title="Volumen vendido por ronda"),
-                use_container_width=True)
+# ÚNICO gráfico (estático): volumen “vendido” al momento de la decisión
+st.markdown("### 🧭 Volumen vendido por ronda (según decisiones)")
+plot_df = pd.DataFrame({
+    "ronda": [int(r) for r in df["round_id"]],
+    "volumen_tn": st.session_state.committed_by_round[:len(df)]
+})
+fig_static = px.bar(plot_df, x="ronda", y="volumen_tn",
+                    title="Volumen vendido por ronda (tn)")
+st.plotly_chart(fig_static, use_container_width=True)
 
 # Resultado final + comparativa acotada
 if "final_res" in st.session_state:
@@ -720,7 +745,6 @@ if "final_res" in st.session_state:
         "Precio (USD/tn)":[res["avg_price_final"]]+list(res["benchmarks"].values())
     })
 
-    # Eje vertical acotado ~20 USD (±10) con dtick=1 y barras angostas
     vmin=float(comp_df["Precio (USD/tn)"].min()); vmax=float(comp_df["Precio (USD/tn)"].max())
     center=(vmin+vmax)/2.0
     y0=center-10.0; y1=center+10.0
@@ -730,4 +754,3 @@ if "final_res" in st.session_state:
     st.plotly_chart(fig, use_container_width=True)
 
 st.markdown("---")
-st.caption("v0.16 — Capacidad y comprometidos corregidos para Cargill Plus (cuenta doble). UP/UB strikes coordinados; UB techo = strike+15; curva más volátil; panel de notificaciones; cierre con venta pendiente a cosecha. Forward = MATBA − 3.")
