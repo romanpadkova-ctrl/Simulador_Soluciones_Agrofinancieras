@@ -4,3 +4,19 @@ backgroundColor="#0b0f0c"
 secondaryBackgroundColor="#112016"
 textColor="#f2fff5"
 font="sans serif"
+
+[server]
+# Ping más frecuente para que el proxy no corte
+websocketPingInterval = 15
+websocketPingTimeout  = 30
+
+# Opcionales útiles
+headless = true
+enableXsrfProtection = true
+enableCORS = false
+
+[client]
+toolbarMode = "auto"
+
+[browser]
+gatherUsageStats = false
