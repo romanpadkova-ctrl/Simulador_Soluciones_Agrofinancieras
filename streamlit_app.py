@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import plotly.express as px
 import streamlit.components.v1 as components
+import uuid
+from typing import Dict, Any
 
 # ==================== BOOT / PAGE ====================
 st.set_page_config(page_title="Simulador de Soluciones Agrofinancieras", layout="wide")
@@ -67,6 +69,54 @@ def log(msg: str):
 def safe_rerun():
     if hasattr(st, "experimental_rerun"): st.experimental_rerun()
     else: st.rerun()
+
+
+# ==================== PERSISTENCIA DE ESTADO (anti-reset) ====================
+@st.cache_data(show_spinner=False)
+def _state_store() -> Dict[str, Dict[str, Any]]:
+    return {}
+
+def get_or_create_sid() -> str:
+    qp = st.query_params
+    sid = qp.get("sid", None)
+    if not sid:
+        sid = uuid.uuid4().hex[:12]
+        st.query_params["sid"] = sid
+    elif isinstance(sid, list):
+        sid = sid[0]
+    return sid
+
+PERSIST_KEYS = [
+    "data_source","uploaded_snapshot","rounds_df","round_idx","total_volume",
+    "forwards","pisos","ultra_pisos","bandas","cplus","duplos","sel_tool",
+    "sel_variant","already_finalized","logs","sold_by_round","undo_stack","final_res"
+]
+
+def snapshot_state() -> Dict[str, Any]:
+    snap = {}
+    ss = st.session_state
+    for k in PERSIST_KEYS:
+        if k in ss:
+            snap[k] = ss[k]
+    return snap
+
+def restore_state(snap: Dict[str, Any]):
+    if not snap:
+        return
+    ss = st.session_state
+    for k, v in snap.items():
+        ss[k] = v
+
+def persist_session(sid: str):
+    store = _state_store()
+    store[sid] = snapshot_state()
+    _state_store.clear()
+    _ = _state_store()
+
+def try_restore_session(sid: str):
+    store = _state_store()
+    if sid in store and store[sid]:
+        restore_state(store[sid])
 
 # ==================== ROUNDS (CURVA) ====================
 def demo_rounds(start_month=9, rounds=9):
@@ -330,6 +380,12 @@ def add_decision(qty:int):
         })
         log(f"🔁 Duplo suscrito: {r1(qty)} tn | disparador {r1(v['trigger'])} | acumulación {r1(v['accum'])} (ronda {rid}).")
 
+    # persistimos luego de la decisión
+    try:
+        persist_session(sid)
+    except Exception:
+        pass
+
 # ==================== MOTOR DE RONDA ====================
 def weighted_avg(old_qty,old_avg,add_qty,add_price):
     add_qty=float(add_qty); add_price=float(add_price)
@@ -525,7 +581,9 @@ def forwards_view_df(include_only_forwards=True) -> pd.DataFrame:
     return df_round1(df)
 
 # ==================== APP ====================
+sid = get_or_create_sid()
 init_state()
+try_restore_session(sid)
 df=st.session_state.rounds_df; idx=st.session_state.round_idx
 mkt=cur_market(); matba=float(mkt["matba_price"]); forward=fwd_from_matba(matba)
 
@@ -546,7 +604,7 @@ with st.sidebar:
     if st.button("Aplicar fuente de datos / Reiniciar", use_container_width=True, disabled=st.session_state.already_finalized):
         st.session_state.rounds_df=demo_rounds(); st.session_state.uploaded_snapshot=None
         reset_position(); st.session_state.data_source = "Simulada v0.7"
-        st.success("Usando curva simulada."); safe_rerun()
+        st.success("Usando curva simulada."); persist_session(sid); safe_rerun()
 
     st.write("---")
     st.subheader("🕒 Ronda actual")
@@ -561,6 +619,7 @@ with st.sidebar:
         if st.session_state.round_idx < len(df)-1:
             st.session_state.round_idx += 1   # avanzamos
             process_round_effects()           # aplicamos efectos con EL NUEVO PRECIO
+            persist_session(sid)
             safe_rerun()
 
     if st.button("🏁 Finalizar y calcular", use_container_width=True, disabled=st.session_state.already_finalized):
@@ -568,10 +627,11 @@ with st.sidebar:
         if res is not None:
             st.session_state["final_res"]=res
         st.session_state.round_idx = len(df)-1
+        persist_session(sid)
         safe_rerun()
 
     if st.button("↩️ Deshacer última acción", use_container_width=True, disabled=st.session_state.already_finalized):
-        undo_last(); safe_rerun()
+        undo_last(); persist_session(sid); safe_rerun()
 
 # Catálogo + agregar
 left, right = st.columns([1.15, 1])
@@ -620,7 +680,7 @@ with left:
 
         submitted = st.form_submit_button("➕ Agregar", disabled=st.session_state.already_finalized)
         if submitted:
-            add_decision(int(qty)); safe_rerun()
+            add_decision(int(qty)); persist_session(sid); safe_rerun()
 
     st.markdown("#### 📝 Notificaciones")
     if st.session_state.logs:
@@ -658,7 +718,7 @@ with right:
                     p["qty_rem"]=r1(p["qty_rem"]-qfix)
                     p["fixed_qty"],p["fixed_avg"]=weighted_avg(p["fixed_qty"],p["fixed_avg"],qfix,fix_price)
                     add_sold_round(rid_now, qfix)
-                    log(f"✅ Piso Asegurado: fijaste {r1(qfix)} tn a {r1(fix_price)}."); safe_rerun()
+                    log(f"✅ Piso Asegurado: fijaste {r1(qfix)} tn a {r1(fix_price)}."); persist_session(sid); safe_rerun()
 
     # UP
     if st.session_state.ultra_pisos:
@@ -678,7 +738,7 @@ with right:
                 c1.write(f"Acumulado: **{r1(up['fixed_qty'])} tn** a **{r1(up['fixed_avg'])}**")
                 c2.write(f"Pendiente: **{pendiente} tn**")
                 if c3.button("Fijar TODO el pendiente al valor de hoy", key=f"upfix_{up['id']}", disabled=pendiente<=0 or st.session_state.already_finalized):
-                    early_fix_ultra_piso_all_pending(up["id"]); safe_rerun()
+                    early_fix_ultra_piso_all_pending(up["id"]); persist_session(sid); safe_rerun()
 
     # UB
     if st.session_state.bandas:
@@ -758,3 +818,10 @@ if "final_res" in st.session_state and st.session_state.already_finalized:
     fig2 = px.bar(comp_df, x="Estrategia", y="Precio (USD/tn)", title="Comparativa de cierre")
     fig2.update_traces(width=0.35)
     st.plotly_chart(fig2, use_container_width=True)
+
+
+# Persistimos al final por las dudas
+try:
+    persist_session(sid)
+except Exception:
+    pass
