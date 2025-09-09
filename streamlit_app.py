@@ -4,6 +4,8 @@ import plotly.express as px
 import streamlit.components.v1 as components
 import uuid
 from typing import Dict, Any
+import os
+import pickle
 
 # ==================== BOOT / PAGE ====================
 st.set_page_config(page_title="Simulador de Soluciones Agrofinancieras", layout="wide")
@@ -18,16 +20,32 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# --- HEARTBEAT anti-inactividad (ping real cada 30s) ---
+# --- HEARTBEAT + SID estable (anti-inactividad y anti-reset por proxy) ---
 components.html(
     """
     <script>
       (function() {
+        // ====== SID estable via localStorage + URL ======
+        try {
+          const url = new URL(window.location.href);
+          let sid = url.searchParams.get('sid');
+          let localSid = localStorage.getItem('aom_sid');
+          if (!localSid) {
+            localSid = (Math.random().toString(36).slice(2) + Date.now().toString(36)).slice(0, 12);
+            localStorage.setItem('aom_sid', localSid);
+          }
+          if (sid !== localSid) {
+            url.searchParams.set('sid', localSid);
+            // Redirigimos 1 vez para que el servidor vea el SID correcto
+            window.location.replace(url.toString());
+            return; // no seguir ejecutando este ciclo
+          }
+        } catch (e) { /* noop */ }
+
+        // ====== Heartbeat para mantener vivo el servicio ======
         const ping = () => {
-          // intenta un endpoint interno súper liviano
           fetch("/_stcore/healthz?" + Date.now(), {cache: "no-store"})
             .catch(() => {
-              // fallback: hace un HEAD a la misma página
               fetch(window.location.href.split("#")[0] + "?" + Date.now(), {
                 method: "HEAD",
                 cache: "no-store"
@@ -51,8 +69,13 @@ except Exception:
 
 # ==================== HELPERS ====================
 EPS = 1e-6
+TMP_DIR = "/tmp/aom_state"
+os.makedirs(TMP_DIR, exist_ok=True)
+
 def r05(x): return round(round(float(x)*2)/2, 1)
+
 def r1(x):  return round(float(x), 1)
+
 
 def df_round1(df: pd.DataFrame) -> pd.DataFrame:
     for c in df.columns:
@@ -60,21 +83,27 @@ def df_round1(df: pd.DataFrame) -> pd.DataFrame:
             df[c] = df[c].astype(float).round(1)
     return df
 
+
 def fwd_from_matba(matba: float) -> float:
     return r05(matba - 3.0)
 
+
 def log(msg: str):
     st.session_state.logs.append(msg)
+
 
 def safe_rerun():
     if hasattr(st, "experimental_rerun"): st.experimental_rerun()
     else: st.rerun()
 
 
-# ==================== PERSISTENCIA DE ESTADO (anti-reset) ====================
+# ==================== PERSISTENCIA DE ESTADO (memoria + disco /tmp) ====================
 @st.cache_data(show_spinner=False)
 def _state_store() -> Dict[str, Dict[str, Any]]:
     return {}
+
+def _sid_file(sid: str) -> str:
+    return os.path.join(TMP_DIR, f"{sid}.pkl")
 
 def get_or_create_sid() -> str:
     qp = st.query_params
@@ -108,15 +137,35 @@ def restore_state(snap: Dict[str, Any]):
         ss[k] = v
 
 def persist_session(sid: str):
+    # memoria
     store = _state_store()
-    store[sid] = snapshot_state()
-    _state_store.clear()
-    _ = _state_store()
+    snap = snapshot_state()
+    store[sid] = snap
+    _state_store.clear(); _ = _state_store()
+    # disco
+    try:
+        with open(_sid_file(sid), "wb") as f:
+            pickle.dump(snap, f)
+    except Exception:
+        pass
 
 def try_restore_session(sid: str):
+    # memoria
     store = _state_store()
     if sid in store and store[sid]:
         restore_state(store[sid])
+        return
+    # disco
+    fpath = _sid_file(sid)
+    if os.path.exists(fpath):
+        try:
+            with open(fpath, "rb") as f:
+                snap = pickle.load(f)
+            if isinstance(snap, dict):
+                restore_state(snap)
+                store = _state_store(); store[sid] = snap; _state_store.clear(); _ = _state_store()
+        except Exception:
+            pass
 
 # ==================== ROUNDS (CURVA) ====================
 def demo_rounds(start_month=9, rounds=9):
@@ -231,11 +280,14 @@ def reset_position():
     ss.logs=[]; ss.sold_by_round={}; ss.undo_stack=[]
 
 def cur_market(): return st.session_state.rounds_df.iloc[st.session_state.round_idx].to_dict()
+
 def last_idx(): return len(st.session_state.rounds_df)-1
+
 def add_forward(qty, price, round_id, tag):
     st.session_state.forwards.append({"qty": r1(qty), "price": r1(price), "round": int(round_id), "tool": tag})
 
 # ==================== MÉTRICAS CAPACIDAD ====================
+
 def committed_breakdown():
     """
     sold_eff: forwards efectivos (solo forwards, incl. C+ forward 1:1)
@@ -262,11 +314,13 @@ def committed_breakdown():
     total_committed = r1(sold_eff + with_price + without_price)
     return r1(sold_eff), r1(with_price), r1(without_price), r1(total_committed)
 
+
 def capacity_left():
     _, _, _, tot = committed_breakdown()
     return max(0.0, float(st.session_state.total_volume) - float(tot))
 
 # ==================== DECISIONES / ALTA ====================
+
 def push_undo():
     ss = st.session_state
     snapshot = {
@@ -297,6 +351,7 @@ def undo_last():
     ss.logs = snap["logs"]
     log("↩️ Se deshizo la última acción.")
 
+
 def select_tool_variant(tool_id, variant):
     st.session_state.sel_tool=tool_id
     st.session_state.sel_variant=variant
@@ -304,6 +359,7 @@ def select_tool_variant(tool_id, variant):
 def add_sold_round(rid, qty):
     if qty <= EPS: return
     st.session_state.sold_by_round[rid] = st.session_state.sold_by_round.get(rid, 0.0) + float(qty)
+
 
 def add_decision(qty:int):
     ss = st.session_state
@@ -387,12 +443,14 @@ def add_decision(qty:int):
         pass
 
 # ==================== MOTOR DE RONDA ====================
+
 def weighted_avg(old_qty,old_avg,add_qty,add_price):
     add_qty=float(add_qty); add_price=float(add_price)
     if add_qty<=0: return r1(old_qty), r1(old_avg)
     new_qty=old_qty+add_qty
     new_avg=(old_qty*old_avg + add_qty*add_price)/new_qty if new_qty>0 else 0.0
     return r1(new_qty), r1(new_avg)
+
 
 def process_round_effects():
     df=st.session_state.rounds_df; idx=st.session_state.round_idx
@@ -444,6 +502,7 @@ def process_round_effects():
         d["acum_last_round"]=rid
 
 # ========= Fijaciones anticipadas =========
+
 def early_fix_ultra_piso_all_pending(up_id):
     df=st.session_state.rounds_df; idx=st.session_state.round_idx
     matba=float(df.iloc[idx]["matba_price"]); rid=int(df.iloc[idx]["round_id"])
@@ -461,6 +520,7 @@ def early_fix_ultra_piso_all_pending(up_id):
         return
 
 # ==================== CIERRE ====================
+
 def finalize_results():
     if st.session_state.already_finalized:
         return None
@@ -544,6 +604,7 @@ def finalize_results():
            }
 
 # ==================== VISTAS / POSICIÓN ====================
+
 def forwards_view_df(include_only_forwards=True) -> pd.DataFrame:
     rows = []
     # Forwards efectivos + lo que decidamos mostrar como línea de forward (expiración libre)
@@ -584,12 +645,13 @@ def forwards_view_df(include_only_forwards=True) -> pd.DataFrame:
 sid = get_or_create_sid()
 init_state()
 try_restore_session(sid)
+
 df=st.session_state.rounds_df; idx=st.session_state.round_idx
 mkt=cur_market(); matba=float(mkt["matba_price"]); forward=fwd_from_matba(matba)
 
 st.title("🧪📈 Simulador de Soluciones Agrofinancieras")
 
-# Sidebar
+# Sidebar (mantenemos el ORDEN original)
 with st.sidebar:
     st.header("⚙️ Configuración")
     total = st.number_input("Volumen total (tn)", min_value=1, max_value=2_000_000,
@@ -730,7 +792,7 @@ with right:
             "cantidad fijada (acumulado)":up["fixed_qty"],"precio promedio (acumulado)":up["fixed_avg"],
             "cantidad pendiente":max(0.0,up["qty_total"]-up["fixed_qty"])
         } for up in st.session_state.ultra_pisos])
-        st.dataframe(df_round1(up_df.drop(columns=["id"])), hide_index=True, use_container_width=True)
+        st.dataframe(up_df.drop(columns=["id"]).pipe(df_round1), hide_index=True, use_container_width=True)
         for up in st.session_state.ultra_pisos:
             with st.expander(f"Fijación anticipada — Ultra Piso (piso {r1(up['strike'])})", expanded=False):
                 c1,c2,c3 = st.columns([1.3,1,1.5])
@@ -813,7 +875,7 @@ if "final_res" in st.session_state and st.session_state.already_finalized:
 
     comp_df=pd.DataFrame({
         "Estrategia":["Promedio alcanzado"]+list(res["benchmarks"].keys()),
-        "Precio (USD/tn)":[res["avg_price_final"]]+list(res["benchmarks"].values())
+        "Precio (USD/tn)": [res["avg_price_final"]]+list(res["benchmarks"].values())
     })
     fig2 = px.bar(comp_df, x="Estrategia", y="Precio (USD/tn)", title="Comparativa de cierre")
     fig2.update_traces(width=0.35)
