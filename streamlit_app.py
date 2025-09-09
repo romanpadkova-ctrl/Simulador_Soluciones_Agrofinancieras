@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from streamlit.components.v1 import html as _html  # <-- keep-alive HTML
+import streamlit.components.v1 as components
 
 # ==================== BOOT / PAGE ====================
 st.set_page_config(page_title="Simulador de Soluciones Agrofinancieras", layout="wide")
@@ -16,7 +16,32 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-# Intento 1: Keep-alive nativo (si no existe en tu versión no rompe)
+# --- HEARTBEAT anti-inactividad (ping real cada 30s) ---
+components.html(
+    """
+    <script>
+      (function() {
+        const ping = () => {
+          // intenta un endpoint interno súper liviano
+          fetch("/_stcore/healthz?" + Date.now(), {cache: "no-store"})
+            .catch(() => {
+              // fallback: hace un HEAD a la misma página
+              fetch(window.location.href.split("#")[0] + "?" + Date.now(), {
+                method: "HEAD",
+                cache: "no-store"
+              }).catch(()=>{});
+            });
+        };
+        // primer ping rápido y luego cada 30s
+        ping();
+        setInterval(ping, 30000);
+      })();
+    </script>
+    """,
+    height=0,
+)
+
+# Keep-alive (si no existe en tu versión no rompe)
 try:
     st.autorefresh(interval=55_000, key="keepalive", debounce=True)
 except Exception:
@@ -415,7 +440,7 @@ def finalize_results():
             add_sold_round(rid, qty)
             log(f"🔒 Cierre ULTRABANDA (pendiente): {r1(qty)} tn a {r1(px)}.")
 
-    # Duplos
+    # Duplos: libera / no procesado -> con precio al último
     for d in st.session_state.duplos:
         unproc=max(0.0,d["qty_total"]-d["processed"])
         if d.get("released_qty",0.0)>EPS:
@@ -429,22 +454,23 @@ def finalize_results():
             add_sold_round(rid, unproc)
             log(f"🔚 Duplo — No Procesado Cierre: {r1(unproc)} tn a {r1(last_forward)}.")
 
-    # Cargill Plus — cerrar techo (no lo listamos como forward; queda en herramientas)
+    # C+ techos -> con precio (no como forward en lista de forwards; lo contamos en métricas/posición de herramientas)
     for c in st.session_state.cplus:
         if c.get("closed"): continue
         px = last_matba if last_matba>c["techo"] else last_forward
         qty = c["qty"]
         add_sold_round(rid, qty)
         c["closed"] = True
-        c["close_price"] = r1(px)
-        log(f"⏱️ Cargill Plus — Expiración (techo): {r1(qty)} tn a {r1(px)}.")
+        log(f"⏱️ Cargill Plus — Expiración: {r1(qty)} tn a {r1(px)}.")
 
-    # Producción libre sin comprometer → visible en posición
+    # Producción libre sin comprometer (si existiera) → crear una línea visible en posición
     ss = st.session_state
     sold_eff, with_price, without_price, total_committed = committed_breakdown()
     missing = max(0.0, float(ss.total_volume) - float(total_committed))
     if missing > EPS:
+        # registrar en gráfico por ronda
         add_sold_round(rid, missing)
+        # agregar a posición como un "forward" rotulado de expiración para que se vea
         add_forward(missing, last_forward, rid, "Expiración — Volumen libre sin comprometer")
         log(f"🌾 Producción libre sin comprometer fijada en la última ronda: {r1(missing)} tn a {r1(last_forward)}.")
 
@@ -464,9 +490,11 @@ def finalize_results():
 # ==================== VISTAS / POSICIÓN ====================
 def forwards_view_df(include_only_forwards=True) -> pd.DataFrame:
     rows = []
+    # Forwards efectivos + lo que decidamos mostrar como línea de forward (expiración libre)
     for f in st.session_state.forwards:
         rows.append(f.copy())
 
+    # Mostrar SIEMPRE las fijaciones de herramientas
     if not include_only_forwards:
         rid_now = int(st.session_state.rounds_df.iloc[st.session_state.round_idx]["round_id"])
 
@@ -496,30 +524,6 @@ def forwards_view_df(include_only_forwards=True) -> pd.DataFrame:
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=["qty","price","round","tool"])
     return df_round1(df)
 
-# ==================== KEEP-ALIVE COMPONENT (anti-proxy) ====================
-def render_keepalive():
-    """
-    Envía un ping periódico a /_stcore/health sin provocar reruns ni parpadeo.
-    Incluye doble método: fetch() y <img> invisible para entornos que bloquean fetch.
-    """
-    _html(
-        """
-        <div style="display:none">
-          <img id="ka_img" alt="." />
-        </div>
-        <script>
-          function ping() {
-            const url = "/_stcore/health?ts=" + Date.now();
-            try { fetch(url, {cache:"no-store", mode:"no-cors"}).catch(()=>{}); } catch(e) {}
-            try { const img = document.getElementById("ka_img"); if (img) img.src = url; } catch(e) {}
-          }
-          ping();
-          setInterval(ping, 45000); // 45s
-        </script>
-        """,
-        height=0,
-    )
-
 # ==================== APP ====================
 init_state()
 df=st.session_state.rounds_df; idx=st.session_state.round_idx
@@ -530,11 +534,6 @@ st.title("🧪📈 Simulador de Soluciones Agrofinancieras")
 # Sidebar
 with st.sidebar:
     st.header("⚙️ Configuración")
-    # Toggle anti-inactividad (ON por defecto)
-    keepalive_on = st.toggle("Evitar inactividad (beta)", value=True, help="Mantiene sesión activa con pings invisibles cada 45s.")
-    if keepalive_on:
-        render_keepalive()
-
     total = st.number_input("Volumen total (tn)", min_value=1, max_value=2_000_000,
                             value=int(st.session_state.total_volume), step=50, disabled=st.session_state.already_finalized)
     if total != st.session_state.total_volume: st.session_state.total_volume = int(total)
